@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"strings"
 	"time"
 
 	"k8s.io/client-go/tools/record"
@@ -139,14 +140,58 @@ func (m *defaultResourceManager) reconcileWithIPTargetType(ctx context.Context, 
 	if err := m.networkingManager.ReconcileForPodEndpoints(ctx, tgb, endpoints); err != nil {
 		return err
 	}
+
+	targetGroupTrackingConfigMap, err := m.targetGroupTrackingConfigMap(ctx, tgb)
+	if err != nil {
+		m.logger.Error(err, "ConfigMap could not be read, multi-cluster TargetGroupBindings are disabled", "namespace", tgb.Namespace, "name", tgb.Name)
+	}
+
 	if len(unmatchedTargets) > 0 {
+		if targetGroupTrackingConfigMap != nil {
+			for i := len(unmatchedTargets) - 1; i >= 0; i-- {
+				endpointUID := endpointUID(awssdk.StringValue(unmatchedTargets[i].Target.Id), awssdk.Int64Value(unmatchedTargets[i].Target.Port))
+				if endpointIsTracked(targetGroupTrackingConfigMap, endpointUID) {
+					m.logger.Info("Removing tracking for target", "namespace", tgb.Namespace, "name", tgb.Name, "target", endpointUID)
+					// if we registered the target, remove from tracking map
+					delete(targetGroupTrackingConfigMap.Data, endpointUID)
+				} else {
+					// if we didn't register the target, remove from unmatchedTargets to prevent deregistration of targets we didn't register
+					unmatchedTargets = append(unmatchedTargets[:i], unmatchedTargets[i+1:]...)
+				}
+			}
+		}
 		if err := m.deregisterTargets(ctx, tgARN, unmatchedTargets); err != nil {
 			return err
 		}
 	}
 	if len(unmatchedEndpoints) > 0 {
+		if targetGroupTrackingConfigMap != nil {
+			for _, endpoint := range unmatchedEndpoints {
+				endpointUID := endpointUID(endpoint.IP, endpoint.Port)
+				m.logger.Info("Adding tracking for target", "target", endpointUID, "tgb", tgb.Name)
+				trackEndpoint(targetGroupTrackingConfigMap, endpointUID)
+			}
+		}
 		if err := m.registerPodEndpoints(ctx, tgARN, unmatchedEndpoints); err != nil {
 			return err
+		}
+	}
+
+	if len(matchedEndpointAndTargets) > 0 && targetGroupTrackingConfigMap != nil {
+		for _, matchedPair := range matchedEndpointAndTargets {
+			endpointUID := endpointUID(matchedPair.endpoint.IP, matchedPair.endpoint.Port)
+			if !endpointIsTracked(targetGroupTrackingConfigMap, endpointUID) {
+				// If the controller observes that there is a matched pair which is not currently tracked, start tracking it
+				m.logger.Info("Adding tracking for target", "target", endpointUID, "tgb", tgb.Name)
+				trackEndpoint(targetGroupTrackingConfigMap, endpointUID)
+			}
+		}
+	}
+
+	if targetGroupTrackingConfigMap != nil {
+		err = m.k8sClient.Update(ctx, targetGroupTrackingConfigMap)
+		if err != nil {
+			m.logger.Error(err, "ConfigMap could not be updated", "name", targetGroupTrackingConfigMap.Name)
 		}
 	}
 
@@ -168,6 +213,38 @@ func (m *defaultResourceManager) reconcileWithIPTargetType(ctx context.Context, 
 
 	_ = drainingTargets
 	return nil
+}
+
+func (m *defaultResourceManager) targetGroupTrackingConfigMap(ctx context.Context, tgb *elbv2api.TargetGroupBinding) (*corev1.ConfigMap, error) {
+	configMap := &corev1.ConfigMap{}
+	err := m.k8sClient.Get(ctx, types.NamespacedName{Name: tgb.Name, Namespace: tgb.Namespace}, configMap)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			m.logger.Info("ConfigMap not found for TargetGroupBinding, multi-cluster TargetGroupBindings are disabled", "name", tgb.Name)
+			return nil, nil
+		} else {
+			return nil, err
+		}
+	}
+	return configMap, nil
+}
+
+func trackEndpoint(configmap *corev1.ConfigMap, endpointUID string) {
+	if configmap.Data == nil {
+		configmap.Data = make(map[string]string)
+	}
+	configmap.Data[endpointUID] = "owned"
+}
+
+func endpointIsTracked(configmap *corev1.ConfigMap, endpointUID string) bool {
+	if configmap.Data != nil && configmap.Data[endpointUID] == "owned" {
+		return true
+	}
+	return false
+}
+
+func endpointUID(ip string, port int64) string {
+	return fmt.Sprintf("%v-%v", strings.Replace(ip, ".", "_", -1), port)
 }
 
 func (m *defaultResourceManager) reconcileWithInstanceTargetType(ctx context.Context, tgb *elbv2api.TargetGroupBinding) error {
