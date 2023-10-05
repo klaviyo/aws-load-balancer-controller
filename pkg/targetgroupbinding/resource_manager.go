@@ -298,7 +298,28 @@ func (m *defaultResourceManager) cleanupTargets(ctx context.Context, tgb *elbv2a
 		}
 		return err
 	}
-	if err := m.deregisterTargets(ctx, tgb.Spec.TargetGroupARN, targets); err != nil {
+
+	targetGroupTrackingConfigMap, err := m.targetGroupTrackingConfigMap(ctx, tgb)
+	if err != nil {
+		m.logger.Error(err, "ConfigMap could not be read, multi-cluster TargetGroupBindings are disabled", "namespace", tgb.Namespace, "name", tgb.Name)
+	}
+
+	targetsToDeregister := make([]TargetInfo, 0)
+	if targetGroupTrackingConfigMap != nil {
+		for _, target := range targets {
+			endpointUID := endpointUID(awssdk.StringValue(target.Target.Id), awssdk.Int64Value(target.Target.Port))
+			if endpointIsTracked(targetGroupTrackingConfigMap, endpointUID) {
+				m.logger.Info("Removing tracking for target", "namespace", tgb.Namespace, "name", tgb.Name, "target", endpointUID)
+				// if we registered the target, remove from tracking map
+				delete(targetGroupTrackingConfigMap.Data, endpointUID)
+				targetsToDeregister = append(targetsToDeregister, target)
+			}
+		}
+	} else {
+		targetsToDeregister = append(targetsToDeregister, targets...)
+	}
+
+	if err := m.deregisterTargets(ctx, tgb.Spec.TargetGroupARN, targetsToDeregister); err != nil {
 		if isELBV2TargetGroupNotFoundError(err) {
 			return nil
 		} else if isELBV2TargetGroupARNInvalidError(err) {
@@ -306,6 +327,14 @@ func (m *defaultResourceManager) cleanupTargets(ctx context.Context, tgb *elbv2a
 		}
 		return err
 	}
+
+	if targetGroupTrackingConfigMap != nil {
+		err = m.k8sClient.Update(ctx, targetGroupTrackingConfigMap)
+		if err != nil {
+			m.logger.Error(err, "ConfigMap could not be updated", "name", targetGroupTrackingConfigMap.Name)
+		}
+	}
+
 	return nil
 }
 
